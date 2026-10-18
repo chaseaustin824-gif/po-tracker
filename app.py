@@ -29,6 +29,7 @@ class PurchaseOrder(db.Model):
     description = db.Column(db.Text, nullable=False, default="")
     amount = db.Column(db.Numeric(12, 2), nullable=False)
     created_at = db.Column(db.DateTime, server_default=func.now())
+    created_by_id = db.Column(db.Integer, db.ForeignKey("app_user.id"), nullable=True)
 
 class User(db.Model):
     __tablename__ = "app_user"
@@ -54,6 +55,19 @@ with app.app_context():
         if "role" not in _cols:
             db.session.execute(text(
                 "ALTER TABLE app_user ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'member'"
+            ))
+            db.session.commit()
+    # Idempotent migration: add the created_by_id column to pre-existing purchase_order tables.
+    if _dialect == "postgresql":
+        db.session.execute(text(
+            "ALTER TABLE purchase_order ADD COLUMN IF NOT EXISTS created_by_id INTEGER REFERENCES app_user(id)"
+        ))
+        db.session.commit()
+    elif _dialect == "sqlite":
+        _po_cols = [row[1] for row in db.session.execute(text("PRAGMA table_info(purchase_order)")).fetchall()]
+        if "created_by_id" not in _po_cols:
+            db.session.execute(text(
+                "ALTER TABLE purchase_order ADD COLUMN created_by_id INTEGER REFERENCES app_user(id)"
             ))
             db.session.commit()
     # Bootstrap the first admin from the environment when no users exist yet.
@@ -108,10 +122,11 @@ button,a.btn{padding:.5rem 1rem;text-decoration:none}</style></head><body>
 
 INDEX = """
 <p class="total">Total: ${{ "{:,.2f}".format(total) }} ({{ count }} POs)</p>
-<table><tr><th>PO #</th><th>Vendor</th><th>Description</th><th>Amount</th><th>Created</th></tr>
+<table><tr><th>PO #</th><th>Vendor</th><th>Description</th><th>Amount</th><th>Created</th><th>Created by</th></tr>
 {% for po in pos %}<tr><td>PO-{{ po.id }}</td><td>{{ po.vendor }}</td><td>{{ po.description }}</td>
-<td>${{ "{:,.2f}".format(po.amount) }}</td><td>{{ po.created_at.strftime('%Y-%m-%d') if po.created_at else '' }}</td></tr>
-{% else %}<tr><td colspan="5">No purchase orders yet.</td></tr>{% endfor %}</table>
+<td>${{ "{:,.2f}".format(po.amount) }}</td><td>{{ po.created_at.strftime('%Y-%m-%d') if po.created_at else '' }}</td>
+<td>{{ creators.get(po.created_by_id, '-') if po.created_by_id else '-' }}</td></tr>
+{% else %}<tr><td colspan="6">No purchase orders yet.</td></tr>{% endfor %}</table>
 """
 
 FORM = """
@@ -330,7 +345,14 @@ def admin_set_role(user_id):
 def index():
     pos = PurchaseOrder.query.order_by(PurchaseOrder.id.desc()).all()
     total = sum((po.amount for po in pos), Decimal("0"))
-    return render(INDEX, pos=pos, total=total, count=len(pos))
+    creator_ids = {po.created_by_id for po in pos if po.created_by_id}
+    creators = {}
+    if creator_ids:
+        creators = {
+            uid: name for uid, name in
+            db.session.query(User.id, User.username).filter(User.id.in_(creator_ids)).all()
+        }
+    return render(INDEX, pos=pos, total=total, count=len(pos), creators=creators)
 
 @app.route("/new", methods=["GET", "POST"])
 def new_po():
@@ -346,7 +368,12 @@ def new_po():
         elif amount is None or amount <= 0:
             flash("Enter a valid amount greater than zero.")
         else:
-            po = PurchaseOrder(vendor=vendor, description=description, amount=amount)
+            po = PurchaseOrder(
+                vendor=vendor,
+                description=description,
+                amount=amount,
+                created_by_id=current_user().id,
+            )
             db.session.add(po)
             db.session.commit()
             flash(f"Created PO-{po.id}.")
