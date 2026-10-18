@@ -1,6 +1,7 @@
+import json
 import os
 from decimal import Decimal, InvalidOperation
-from flask import Flask, request, redirect, url_for, render_template_string, flash
+from flask import Flask, Response, request, redirect, url_for, render_template_string, flash
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func
 
@@ -25,6 +26,12 @@ with app.app_context():
 
 BASE = """
 <!doctype html><html><head><meta charset="utf-8"><title>PO Tracker</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1f6feb">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="PO Tracker">
+<link rel="manifest" href="{{ url_for('manifest') }}">
+<link rel="apple-touch-icon" href="{{ url_for('icon') }}">
 <style>body{font-family:sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.4rem;text-align:left}
 .flash{color:#b00}.total{font-size:1.4rem;font-weight:bold}input,textarea{width:100%;padding:.4rem;margin:.2rem 0 .8rem}
@@ -33,6 +40,7 @@ button,a.btn{padding:.5rem 1rem;text-decoration:none}</style></head><body>
 <p><a class="btn" href="{{ url_for('index') }}">Dashboard</a> <a class="btn" href="{{ url_for('new_po') }}">New PO</a></p>
 {% for m in get_flashed_messages() %}<p class="flash">{{ m }}</p>{% endfor %}
 {{ body|safe }}
+<script>if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');</script>
 </body></html>
 """
 
@@ -82,6 +90,42 @@ def new_po():
             flash(f"Created PO-{po.id}.")
             return redirect(url_for("index"))
     return render(FORM)
+
+@app.route("/manifest.webmanifest")
+def manifest():
+    data = {
+        "name": "PO Tracker",
+        "short_name": "POs",
+        "start_url": "/",
+        "display": "standalone",
+        "background_color": "#ffffff",
+        "theme_color": "#1f6feb",
+        "icons": [
+            {"src": url_for("icon"), "sizes": "any", "type": "image/svg+xml"},
+        ],
+    }
+    return Response(json.dumps(data), mimetype="application/manifest+json")
+
+ICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">'
+    '<rect width="512" height="512" rx="96" fill="#1f6feb"/>'
+    '<text x="256" y="340" font-family="sans-serif" font-size="240" '
+    'font-weight="bold" text-anchor="middle" fill="#fff">PO</text></svg>'
+)
+
+@app.route("/icon.svg")
+def icon():
+    return Response(ICON_SVG, mimetype="image/svg+xml")
+
+SW_JS = """
+self.addEventListener('install', function (event) { self.skipWaiting(); });
+self.addEventListener('activate', function (event) { event.waitUntil(self.clients.claim()); });
+self.addEventListener('fetch', function (event) { event.respondWith(fetch(event.request)); });
+"""
+
+@app.route("/sw.js")
+def sw():
+    return Response(SW_JS, mimetype="application/javascript")
 
 @app.route("/healthz")
 def healthz():
