@@ -6,8 +6,8 @@ from functools import wraps
 from urllib.parse import urlparse
 from flask import Flask, Response, abort, request, redirect, url_for, render_template_string, flash, session
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
@@ -36,18 +36,58 @@ class User(db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     password_hash = db.Column(db.String(255), nullable=False)
     is_active = db.Column(db.Boolean, default=True)
+    role = db.Column(db.String(20), nullable=False, default="member")
+
+VALID_ROLES = ("admin", "member")
+
+def _migrate_user_role():
+    """Idempotently add app_user.role to databases created before roles existed."""
+    dialect = db.engine.dialect.name
+    if dialect == "postgresql":
+        with db.engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE app_user ADD COLUMN IF NOT EXISTS role "
+                "VARCHAR(20) NOT NULL DEFAULT 'member'"
+            ))
+    elif dialect == "sqlite":
+        def has_role(conn):
+            rows = conn.execute(text("PRAGMA table_info(app_user)")).fetchall()
+            return any(row[1] == "role" for row in rows)
+        with db.engine.begin() as conn:
+            missing = not has_role(conn)
+        if missing:
+            try:
+                with db.engine.begin() as conn:
+                    conn.execute(text(
+                        "ALTER TABLE app_user ADD COLUMN role "
+                        "VARCHAR(20) NOT NULL DEFAULT 'member'"
+                    ))
+            except OperationalError:
+                # Another worker may have added the column first.
+                with db.engine.begin() as conn:
+                    if not has_role(conn):
+                        raise
 
 with app.app_context():
     db.create_all()
-    # Bootstrap the first admin from the environment when no users exist yet.
+    _migrate_user_role()
     _admin_username = os.environ.get("ADMIN_USERNAME", "").strip()
     _admin_password = os.environ.get("ADMIN_PASSWORD", "")
+    # Promote the bootstrap account to admin.
+    if _admin_username:
+        with db.engine.begin() as conn:
+            conn.execute(
+                text("UPDATE app_user SET role = 'admin' WHERE username = :username"),
+                {"username": _admin_username},
+            )
+    # Bootstrap the first admin from the environment when no users exist yet.
     if _admin_username and _admin_password and User.query.first() is None:
         try:
             db.session.add(User(
                 username=_admin_username,
                 password_hash=generate_password_hash(_admin_password),
                 is_active=True,
+                role="admin",
             ))
             db.session.commit()
         except IntegrityError:
@@ -105,18 +145,24 @@ LOGIN = """
 
 ADMIN_USERS = """
 <h2>Users</h2>
-<table><tr><th>Username</th><th>Status</th><th>Reset password</th><th></th></tr>
-{% for u in users %}<tr><td>{{ u.username }}</td><td>{{ 'Active' if u.is_active else 'Disabled' }}</td>
+<table><tr><th>Username</th><th>Role</th><th>Status</th><th>Reset password</th><th></th><th></th></tr>
+{% for u in users %}<tr><td>{{ u.username }}</td><td>{{ u.role }}</td><td>{{ 'Active' if u.is_active else 'Disabled' }}</td>
 <td><form method="post" action="{{ url_for('admin_reset_password', user_id=u.id) }}">
 <input type="password" name="password" required minlength="8" autocomplete="new-password" placeholder="New password (min 8)">
 <button type="submit">Reset</button></form></td>
 <td>{% if u.id != current_id %}<form method="post" action="{{ url_for('admin_toggle_user', user_id=u.id) }}">
-<button type="submit">{{ 'Disable' if u.is_active else 'Enable' }}</button></form>{% endif %}</td></tr>
+<button type="submit">{{ 'Disable' if u.is_active else 'Enable' }}</button></form>{% endif %}</td>
+<td>{% if u.id != current_id %}<form method="post" action="{{ url_for('admin_set_role', user_id=u.id) }}">
+<button type="submit">{{ 'Make member' if u.role == 'admin' else 'Make admin' }}</button></form>{% endif %}</td></tr>
 {% endfor %}</table>
 <h2>Create user</h2>
 <form method="post" action="{{ url_for('admin_users') }}">
 <label>Username<input name="username" required maxlength="80" autocomplete="off"></label>
 <label>Password (at least 8 characters)<input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
+<label>Role<select name="role">
+<option value="member" selected>member</option>
+<option value="admin">admin</option>
+</select></label>
 <button type="submit">Create user</button>
 </form>
 """
@@ -183,9 +229,8 @@ def current_user():
     return None
 
 def is_admin(user):
-    """Admin means the username equals the ADMIN_USERNAME environment variable."""
-    admin_username = os.environ.get("ADMIN_USERNAME", "").strip()
-    return user is not None and bool(admin_username) and user.username == admin_username
+    """Admin means the user has the "admin" role."""
+    return user is not None and user.role == "admin"
 
 def admin_required(view):
     @wraps(view)
@@ -205,12 +250,15 @@ def admin_users():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        role = request.form.get("role", "member")
         if not username:
             flash("Username is required.")
         elif len(username) > 80:
             flash("Username must be 80 characters or fewer.")
         elif len(password) < 8:
             flash("Password must be at least 8 characters.")
+        elif role not in VALID_ROLES:
+            flash("Invalid role.")
         elif User.query.filter_by(username=username).first() is not None:
             flash("That username is already taken.")
         else:
@@ -219,6 +267,7 @@ def admin_users():
                     username=username,
                     password_hash=generate_password_hash(password),
                     is_active=True,
+                    role=role,
                 ))
                 db.session.commit()
                 flash(f"Created user {username}.")
@@ -256,6 +305,20 @@ def admin_toggle_user(user_id):
         user.is_active = not user.is_active
         db.session.commit()
         flash(f"{user.username} is now {'active' if user.is_active else 'disabled'}.")
+    return redirect(url_for("admin_users"))
+
+@app.route("/admin/users/<int:user_id>/role", methods=["POST"])
+@admin_required
+def admin_set_role(user_id):
+    user = db.session.get(User, user_id)
+    if user is None:
+        abort(404)
+    if user.id == current_user().id:
+        flash("You cannot change your own role.")
+    else:
+        user.role = "member" if user.role == "admin" else "admin"
+        db.session.commit()
+        flash(f"{user.username} is now {user.role}.")
     return redirect(url_for("admin_users"))
 
 @app.route("/")
