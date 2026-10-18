@@ -435,8 +435,8 @@ def delete_po(po_id):
 def logo():
     return send_from_directory(
         os.path.dirname(os.path.abspath(__file__)),
-        "1782435735830.png",
-        mimetype="image/png",
+        "SScolor 03.jpg",
+        mimetype="image/jpeg",
         max_age=86400,
     )
 
