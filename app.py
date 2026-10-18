@@ -2,8 +2,9 @@ import json
 import os
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
+from functools import wraps
 from urllib.parse import urlparse
-from flask import Flask, Response, request, redirect, url_for, render_template_string, flash, session
+from flask import Flask, Response, abort, request, redirect, url_for, render_template_string, flash, session
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -69,7 +70,7 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;pad
 .flash{color:#b00}.total{font-size:1.4rem;font-weight:bold}input,textarea{width:100%;padding:.4rem;margin:.2rem 0 .8rem}
 button,a.btn{padding:.5rem 1rem;text-decoration:none}</style></head><body>
 <h1>PO Tracker</h1>
-<p><a class="btn" href="{{ url_for('index') }}">Dashboard</a> <a class="btn" href="{{ url_for('new_po') }}">New PO</a>{% if session.get('user_id') %} <a class="btn" href="{{ url_for('logout') }}">Log out</a>{% endif %}</p>
+<p><a class="btn" href="{{ url_for('index') }}">Dashboard</a> <a class="btn" href="{{ url_for('new_po') }}">New PO</a>{% if show_users_link %} <a class="btn" href="{{ url_for('admin_users') }}">Users</a>{% endif %}{% if session.get('user_id') %} <a class="btn" href="{{ url_for('logout') }}">Log out</a>{% endif %}</p>
 {% for m in get_flashed_messages() %}<p class="flash">{{ m }}</p>{% endfor %}
 {{ body|safe }}
 <script>if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');</script>
@@ -99,6 +100,24 @@ LOGIN = """
 <label>Username<input name="username" required autofocus maxlength="80" autocomplete="username"></label>
 <label>Password<input type="password" name="password" required autocomplete="current-password"></label>
 <button type="submit">Sign in</button>
+</form>
+"""
+
+ADMIN_USERS = """
+<h2>Users</h2>
+<table><tr><th>Username</th><th>Status</th><th>Reset password</th><th></th></tr>
+{% for u in users %}<tr><td>{{ u.username }}</td><td>{{ 'Active' if u.is_active else 'Disabled' }}</td>
+<td><form method="post" action="{{ url_for('admin_reset_password', user_id=u.id) }}">
+<input type="password" name="password" required minlength="8" autocomplete="new-password" placeholder="New password (min 8)">
+<button type="submit">Reset</button></form></td>
+<td>{% if u.id != current_id %}<form method="post" action="{{ url_for('admin_toggle_user', user_id=u.id) }}">
+<button type="submit">{{ 'Disable' if u.is_active else 'Enable' }}</button></form>{% endif %}</td></tr>
+{% endfor %}</table>
+<h2>Create user</h2>
+<form method="post" action="{{ url_for('admin_users') }}">
+<label>Username<input name="username" required maxlength="80" autocomplete="off"></label>
+<label>Password (at least 8 characters)<input type="password" name="password" required minlength="8" autocomplete="new-password"></label>
+<button type="submit">Create user</button>
 </form>
 """
 
@@ -152,6 +171,92 @@ def login():
 def logout():
     session.clear()
     return redirect(url_for("login"))
+
+def current_user():
+    """Return the active User for the session, or None."""
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    user = db.session.get(User, user_id)
+    if user is not None and user.is_active:
+        return user
+    return None
+
+def is_admin(user):
+    """Admin means the username equals the ADMIN_USERNAME environment variable."""
+    admin_username = os.environ.get("ADMIN_USERNAME", "").strip()
+    return user is not None and bool(admin_username) and user.username == admin_username
+
+def admin_required(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        if not is_admin(current_user()):
+            abort(403)
+        return view(*args, **kwargs)
+    return wrapper
+
+@app.context_processor
+def inject_nav():
+    return {"show_users_link": is_admin(current_user())}
+
+@app.route("/admin/users", methods=["GET", "POST"])
+@admin_required
+def admin_users():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        if not username:
+            flash("Username is required.")
+        elif len(username) > 80:
+            flash("Username must be 80 characters or fewer.")
+        elif len(password) < 8:
+            flash("Password must be at least 8 characters.")
+        elif User.query.filter_by(username=username).first() is not None:
+            flash("That username is already taken.")
+        else:
+            try:
+                db.session.add(User(
+                    username=username,
+                    password_hash=generate_password_hash(password),
+                    is_active=True,
+                ))
+                db.session.commit()
+                flash(f"Created user {username}.")
+            except IntegrityError:
+                db.session.rollback()
+                flash("That username is already taken.")
+        return redirect(url_for("admin_users"))
+    users = User.query.order_by(User.username).all()
+    return render(ADMIN_USERS, users=users, current_id=current_user().id)
+
+@app.route("/admin/users/<int:user_id>/password", methods=["POST"])
+@admin_required
+def admin_reset_password(user_id):
+    user = db.session.get(User, user_id)
+    if user is None:
+        abort(404)
+    password = request.form.get("password", "")
+    if len(password) < 8:
+        flash("Password must be at least 8 characters.")
+    else:
+        user.password_hash = generate_password_hash(password)
+        db.session.commit()
+        flash(f"Password reset for {user.username}.")
+    return redirect(url_for("admin_users"))
+
+@app.route("/admin/users/<int:user_id>/toggle", methods=["POST"])
+@admin_required
+def admin_toggle_user(user_id):
+    user = db.session.get(User, user_id)
+    if user is None:
+        abort(404)
+    if user.id == current_user().id:
+        flash("You cannot disable your own account.")
+    else:
+        user.is_active = not user.is_active
+        db.session.commit()
+        flash(f"{user.username} is now {'active' if user.is_active else 'disabled'}.")
+    return redirect(url_for("admin_users"))
 
 @app.route("/")
 def index():
