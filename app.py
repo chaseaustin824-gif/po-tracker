@@ -4,7 +4,7 @@ from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from urllib.parse import urlparse
-from flask import Flask, Response, abort, request, redirect, url_for, render_template_string, flash, session
+from flask import Flask, Response, abort, request, redirect, url_for, render_template_string, flash, session, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
@@ -116,7 +116,7 @@ button,a.btn{padding:.5rem 1rem;text-decoration:none}
 .site-header .logo-link{display:inline-flex;flex:0 0 auto;max-width:40%}
 .site-header img{height:48px;width:auto;max-width:100%}
 .site-header h1{margin:0}</style></head><body>
-<header class="site-header"><a class="logo-link" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='church-logo.png') }}" alt="Church logo"></a>
+<header class="site-header"><a class="logo-link" href="{{ url_for('index') }}"><img src="{{ url_for('logo') }}" alt="Church logo"></a>
 <h1>PO Tracker</h1></header>
 <p><a class="btn" href="{{ url_for('index') }}">Dashboard</a> <a class="btn" href="{{ url_for('new_po') }}">New PO</a>{% if show_users_link %} <a class="btn" href="{{ url_for('admin_users') }}">Users</a>{% endif %}{% if session.get('user_id') %} <a class="btn" href="{{ url_for('logout') }}">Log out</a>{% endif %}</p>
 {% for m in get_flashed_messages() %}<p class="flash">{{ m }}</p>{% endfor %}
@@ -183,7 +183,7 @@ ADMIN_USERS = """
 def render(template, **ctx):
     return render_template_string(BASE, body=render_template_string(template, **ctx))
 
-PUBLIC_ENDPOINTS = {"login", "logout", "healthz", "manifest", "icon", "sw", "static"}
+PUBLIC_ENDPOINTS = {"login", "logout", "healthz", "manifest", "icon", "sw", "static", "logo"}
 
 def safe_next(target):
     """Only allow same-site relative redirects."""
@@ -430,6 +430,15 @@ def delete_po(po_id):
     db.session.commit()
     flash(f"Deleted PO-{po_id}.")
     return redirect(url_for("index"))
+
+@app.route("/logo.png")
+def logo():
+    return send_from_directory(
+        os.path.dirname(os.path.abspath(__file__)),
+        "1782435735830.png",
+        mimetype="image/png",
+        max_age=86400,
+    )
 
 @app.route("/manifest.webmanifest")
 def manifest():
