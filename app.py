@@ -122,19 +122,22 @@ button,a.btn{padding:.5rem 1rem;text-decoration:none}</style></head><body>
 
 INDEX = """
 <p class="total">Total: ${{ "{:,.2f}".format(total) }} ({{ count }} POs)</p>
-<table><tr><th>PO #</th><th>Vendor</th><th>Description</th><th>Amount</th><th>Created</th><th>Created by</th></tr>
+<table><tr><th>PO #</th><th>Vendor</th><th>Description</th><th>Amount</th><th>Created</th><th>Created by</th>{% if is_admin %}<th></th>{% endif %}</tr>
 {% for po in pos %}<tr><td>PO-{{ po.id }}</td><td>{{ po.vendor }}</td><td>{{ po.description }}</td>
 <td>${{ "{:,.2f}".format(po.amount) }}</td><td>{{ po.created_at.strftime('%Y-%m-%d') if po.created_at else '' }}</td>
-<td>{{ creators.get(po.created_by_id, '-') if po.created_by_id else '-' }}</td></tr>
-{% else %}<tr><td colspan="6">No purchase orders yet.</td></tr>{% endfor %}</table>
+<td>{{ creators.get(po.created_by_id, '-') if po.created_by_id else '-' }}</td>
+{% if is_admin %}<td><a class="btn" href="{{ url_for('edit_po', po_id=po.id) }}">Edit</a>
+<form method="post" action="{{ url_for('delete_po', po_id=po.id) }}" style="display:inline" onsubmit="return confirm('Delete PO-{{ po.id }}? This cannot be undone.');">
+<button type="submit">Delete</button></form></td>{% endif %}</tr>
+{% else %}<tr><td colspan="{{ 7 if is_admin else 6 }}">No purchase orders yet.</td></tr>{% endfor %}</table>
 """
 
 FORM = """
 <form method="post">
-<label>Vendor<input name="vendor" required maxlength="200"></label>
-<label>Description<textarea name="description" rows="3"></textarea></label>
-<label>Amount (USD)<input name="amount" required inputmode="decimal" placeholder="0.00"></label>
-<button type="submit">Create PO</button>
+<label>Vendor<input name="vendor" required maxlength="200" value="{{ vendor or '' }}"></label>
+<label>Description<textarea name="description" rows="3">{{ description or '' }}</textarea></label>
+<label>Amount (USD)<input name="amount" required inputmode="decimal" placeholder="0.00" value="{{ amount or '' }}"></label>
+<button type="submit">{{ submit_label or 'Create PO' }}</button>
 </form>
 """
 
@@ -352,7 +355,8 @@ def index():
             uid: name for uid, name in
             db.session.query(User.id, User.username).filter(User.id.in_(creator_ids)).all()
         }
-    return render(INDEX, pos=pos, total=total, count=len(pos), creators=creators)
+    return render(INDEX, pos=pos, total=total, count=len(pos), creators=creators,
+                  is_admin=is_admin(current_user()))
 
 @app.route("/new", methods=["GET", "POST"])
 def new_po():
@@ -379,6 +383,48 @@ def new_po():
             flash(f"Created PO-{po.id}.")
             return redirect(url_for("index"))
     return render(FORM)
+
+@app.route("/pos/<int:po_id>/edit", methods=["GET", "POST"])
+@admin_required
+def edit_po(po_id):
+    po = db.session.get(PurchaseOrder, po_id)
+    if po is None:
+        abort(404)
+    if request.method == "POST":
+        vendor = request.form.get("vendor", "").strip()
+        description = request.form.get("description", "").strip()
+        raw_amount = request.form.get("amount", "").strip()
+        try:
+            amount = Decimal(raw_amount).quantize(Decimal("0.01"))
+        except (InvalidOperation, ValueError):
+            amount = None
+        if not vendor:
+            flash("Vendor is required.")
+        elif amount is None or amount <= 0:
+            flash("Enter a valid amount greater than zero.")
+        else:
+            # Only vendor, description and amount change; creator and created date are preserved.
+            po.vendor = vendor
+            po.description = description
+            po.amount = amount
+            db.session.commit()
+            flash(f"Updated PO-{po.id}.")
+            return redirect(url_for("index"))
+        return render(FORM, vendor=vendor, description=description, amount=raw_amount,
+                      submit_label="Save changes")
+    return render(FORM, vendor=po.vendor, description=po.description,
+                  amount="{:.2f}".format(po.amount), submit_label="Save changes")
+
+@app.route("/pos/<int:po_id>/delete", methods=["POST"])
+@admin_required
+def delete_po(po_id):
+    po = db.session.get(PurchaseOrder, po_id)
+    if po is None:
+        abort(404)
+    db.session.delete(po)
+    db.session.commit()
+    flash(f"Deleted PO-{po_id}.")
+    return redirect(url_for("index"))
 
 @app.route("/manifest.webmanifest")
 def manifest():
