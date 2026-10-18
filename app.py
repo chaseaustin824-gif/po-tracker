@@ -111,8 +111,13 @@ BASE = """
 <style>body{font-family:sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem}
 table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:.4rem;text-align:left}
 .flash{color:#b00}.total{font-size:1.4rem;font-weight:bold}input,textarea{width:100%;padding:.4rem;margin:.2rem 0 .8rem}
-button,a.btn{padding:.5rem 1rem;text-decoration:none}</style></head><body>
-<h1>PO Tracker</h1>
+button,a.btn{padding:.5rem 1rem;text-decoration:none}
+.site-header{display:flex;align-items:center;gap:1rem;margin-bottom:1rem}
+.site-header .logo-link{display:inline-flex;flex:0 0 auto;max-width:40%}
+.site-header img{height:48px;width:auto;max-width:100%}
+.site-header h1{margin:0}</style></head><body>
+<header class="site-header"><a class="logo-link" href="{{ url_for('index') }}"><img src="{{ url_for('static', filename='church-logo.png') }}" alt="Church logo"></a>
+<h1>PO Tracker</h1></header>
 <p><a class="btn" href="{{ url_for('index') }}">Dashboard</a> <a class="btn" href="{{ url_for('new_po') }}">New PO</a>{% if show_users_link %} <a class="btn" href="{{ url_for('admin_users') }}">Users</a>{% endif %}{% if session.get('user_id') %} <a class="btn" href="{{ url_for('logout') }}">Log out</a>{% endif %}</p>
 {% for m in get_flashed_messages() %}<p class="flash">{{ m }}</p>{% endfor %}
 {{ body|safe }}
