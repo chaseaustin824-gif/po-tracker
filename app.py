@@ -1,12 +1,20 @@
 import json
 import os
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
-from flask import Flask, Response, request, redirect, url_for, render_template_string, flash
+from urllib.parse import urlparse
+from flask import Flask, Response, request, redirect, url_for, render_template_string, flash, session
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
+app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.permanent_session_lifetime = timedelta(hours=12)
 db_url = os.environ.get("DATABASE_URL", "sqlite:///local.db")
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
@@ -21,8 +29,32 @@ class PurchaseOrder(db.Model):
     amount = db.Column(db.Numeric(12, 2), nullable=False)
     created_at = db.Column(db.DateTime, server_default=func.now())
 
+class User(db.Model):
+    __tablename__ = "app_user"
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    is_active = db.Column(db.Boolean, default=True)
+
 with app.app_context():
     db.create_all()
+    # Bootstrap the first admin from the environment when no users exist yet.
+    _admin_username = os.environ.get("ADMIN_USERNAME", "").strip()
+    _admin_password = os.environ.get("ADMIN_PASSWORD", "")
+    if _admin_username and _admin_password and User.query.first() is None:
+        try:
+            db.session.add(User(
+                username=_admin_username,
+                password_hash=generate_password_hash(_admin_password),
+                is_active=True,
+            ))
+            db.session.commit()
+        except IntegrityError:
+            # Another worker created the user first.
+            db.session.rollback()
+
+# Used to equalize timing when the username does not exist.
+_DUMMY_HASH = generate_password_hash("not-a-real-password")
 
 BASE = """
 <!doctype html><html><head><meta charset="utf-8"><title>PO Tracker</title>
@@ -37,7 +69,7 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;pad
 .flash{color:#b00}.total{font-size:1.4rem;font-weight:bold}input,textarea{width:100%;padding:.4rem;margin:.2rem 0 .8rem}
 button,a.btn{padding:.5rem 1rem;text-decoration:none}</style></head><body>
 <h1>PO Tracker</h1>
-<p><a class="btn" href="{{ url_for('index') }}">Dashboard</a> <a class="btn" href="{{ url_for('new_po') }}">New PO</a></p>
+<p><a class="btn" href="{{ url_for('index') }}">Dashboard</a> <a class="btn" href="{{ url_for('new_po') }}">New PO</a>{% if session.get('user_id') %} <a class="btn" href="{{ url_for('logout') }}">Log out</a>{% endif %}</p>
 {% for m in get_flashed_messages() %}<p class="flash">{{ m }}</p>{% endfor %}
 {{ body|safe }}
 <script>if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');</script>
@@ -61,8 +93,65 @@ FORM = """
 </form>
 """
 
+LOGIN = """
+<form method="post">
+<input type="hidden" name="next" value="{{ next_url }}">
+<label>Username<input name="username" required autofocus maxlength="80" autocomplete="username"></label>
+<label>Password<input type="password" name="password" required autocomplete="current-password"></label>
+<button type="submit">Sign in</button>
+</form>
+"""
+
 def render(template, **ctx):
     return render_template_string(BASE, body=render_template_string(template, **ctx))
+
+PUBLIC_ENDPOINTS = {"login", "logout", "healthz", "manifest", "icon", "sw", "static"}
+
+def safe_next(target):
+    """Only allow same-site relative redirects."""
+    if not target or not target.startswith("/") or target.startswith("//") or "\\" in target:
+        return url_for("index")
+    parsed = urlparse(target)
+    if parsed.scheme or parsed.netloc:
+        return url_for("index")
+    return target
+
+@app.before_request
+def require_login():
+    if request.endpoint is None or request.endpoint in PUBLIC_ENDPOINTS:
+        return None
+    user_id = session.get("user_id")
+    user = db.session.get(User, user_id) if user_id else None
+    if user is not None and user.is_active:
+        return None
+    session.clear()
+    next_url = request.full_path.rstrip("?") if request.method == "GET" else None
+    return redirect(url_for("login", next=next_url) if next_url else url_for("login"))
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        user = User.query.filter_by(username=username).first() if username else None
+        if user is not None:
+            password_ok = check_password_hash(user.password_hash, password)
+        else:
+            check_password_hash(_DUMMY_HASH, password)
+            password_ok = False
+        if user is not None and user.is_active and password_ok:
+            session.clear()
+            session.permanent = True
+            session["user_id"] = user.id
+            return redirect(safe_next(request.form.get("next", "")))
+        flash("Invalid username or password.")
+        return render(LOGIN, next_url=request.form.get("next", "")), 401
+    return render(LOGIN, next_url=request.args.get("next", ""))
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 @app.route("/")
 def index():
