@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from functools import wraps
 from urllib.parse import urlparse
@@ -38,6 +38,15 @@ class User(db.Model):
     password_hash = db.Column(db.String(255), nullable=False)
     is_active = db.Column(db.Boolean, default=True)
     role = db.Column(db.String(20), nullable=False, default="member")
+
+class LoginAttempt(db.Model):
+    """Failed-login counter for one throttle key ("user:<name>" or "ip:<addr>")."""
+    __tablename__ = "login_attempt"
+    id = db.Column(db.Integer, primary_key=True)
+    key = db.Column(db.String(255), unique=True, index=True, nullable=False)
+    failed_count = db.Column(db.Integer, nullable=False, default=0)
+    window_start = db.Column(db.DateTime, nullable=False)
+    locked_until = db.Column(db.DateTime, nullable=True)
 
 VALID_ROLES = ("admin", "member")
 
@@ -206,11 +215,68 @@ def require_login():
     next_url = request.full_path.rstrip("?") if request.method == "GET" else None
     return redirect(url_for("login", next=next_url) if next_url else url_for("login"))
 
+# Login throttling: 5 failed attempts within a 15-minute window for the same
+# username OR the same client IP locks that key for 15 minutes, measured from
+# the most recent failure. While a key is locked the password is not checked.
+# Counts live in the login_attempt table so they survive redeploys. Unknown
+# usernames are counted exactly like known ones so responses never reveal
+# whether an account exists. A successful login clears both keys.
+LOGIN_MAX_FAILURES = 5
+LOGIN_WINDOW = timedelta(minutes=15)
+LOGIN_LOCKOUT = timedelta(minutes=15)
+
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def _throttle_keys(username):
+    keys = ["ip:" + (request.remote_addr or "unknown")]
+    name = username.strip().lower()[:100]
+    if name:
+        keys.append("user:" + name)
+    return keys
+
+def _login_locked(keys):
+    now = _utcnow()
+    return db.session.query(LoginAttempt.id).filter(
+        LoginAttempt.key.in_(keys), LoginAttempt.locked_until > now
+    ).first() is not None
+
+def _record_login_failure(keys):
+    for attempt in range(2):
+        now = _utcnow()
+        rows = {r.key: r for r in LoginAttempt.query.filter(LoginAttempt.key.in_(keys)).all()}
+        for key in keys:
+            row = rows.get(key)
+            if row is None:
+                row = LoginAttempt(key=key, failed_count=0, window_start=now)
+                db.session.add(row)
+            if now - row.window_start > LOGIN_WINDOW:
+                row.failed_count = 0
+                row.window_start = now
+                row.locked_until = None
+            row.failed_count += 1
+            if row.failed_count >= LOGIN_MAX_FAILURES:
+                row.locked_until = now + LOGIN_LOCKOUT
+        try:
+            db.session.commit()
+            return
+        except IntegrityError:
+            # A concurrent request created the same key; retry once against its row.
+            db.session.rollback()
+
+def _clear_login_failures(keys):
+    LoginAttempt.query.filter(LoginAttempt.key.in_(keys)).delete(synchronize_session=False)
+    db.session.commit()
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        throttle_keys = _throttle_keys(username)
+        if _login_locked(throttle_keys):
+            flash("Too many failed attempts. Try again in a few minutes.")
+            return render(LOGIN, next_url=request.form.get("next", "")), 429
         user = User.query.filter_by(username=username).first() if username else None
         if user is not None:
             password_ok = check_password_hash(user.password_hash, password)
@@ -218,10 +284,12 @@ def login():
             check_password_hash(_DUMMY_HASH, password)
             password_ok = False
         if user is not None and user.is_active and password_ok:
+            _clear_login_failures(throttle_keys)
             session.clear()
             session.permanent = True
             session["user_id"] = user.id
             return redirect(safe_next(request.form.get("next", "")))
+        _record_login_failure(throttle_keys)
         flash("Invalid username or password.")
         return render(LOGIN, next_url=request.form.get("next", "")), 401
     return render(LOGIN, next_url=request.args.get("next", ""))
