@@ -59,12 +59,17 @@ with app.app_context():
     # Bootstrap the first admin from the environment when no users exist yet.
     _admin_username = os.environ.get("ADMIN_USERNAME", "").strip()
     _admin_password = os.environ.get("ADMIN_PASSWORD", "")
+    # One-time promotion: only when no admin exists, so a demotion persists across restarts.
     if _admin_username:
-        db.session.execute(
-            text("UPDATE app_user SET role = 'admin' WHERE username = :u"),
-            {"u": _admin_username},
-        )
-        db.session.commit()
+        _admin_count = db.session.execute(
+            text("SELECT COUNT(*) FROM app_user WHERE role = 'admin'")
+        ).scalar()
+        if not _admin_count:
+            db.session.execute(
+                text("UPDATE app_user SET role = 'admin' WHERE username = :u"),
+                {"u": _admin_username},
+            )
+            db.session.commit()
     if _admin_username and _admin_password and User.query.first() is None:
         try:
             db.session.add(User(
@@ -131,13 +136,14 @@ ADMIN_USERS = """
 <h2>Users</h2>
 <table><tr><th>Username</th><th>Role</th><th>Status</th><th>Reset password</th><th></th><th></th></tr>
 {% for u in users %}<tr><td>{{ u.username }}</td><td>{{ u.role }}</td><td>{{ 'Active' if u.is_active else 'Disabled' }}</td>
+{% if u.id == bootstrap_id and u.id != current_id %}<td colspan="3">Protected</td>{% else %}
 <td><form method="post" action="{{ url_for('admin_reset_password', user_id=u.id) }}">
 <input type="password" name="password" required minlength="8" autocomplete="new-password" placeholder="New password (min 8)">
 <button type="submit">Reset</button></form></td>
 <td>{% if u.id != current_id %}<form method="post" action="{{ url_for('admin_toggle_user', user_id=u.id) }}">
 <button type="submit">{{ 'Disable' if u.is_active else 'Enable' }}</button></form>{% endif %}</td>
 <td>{% if u.id != current_id %}<form method="post" action="{{ url_for('admin_set_role', user_id=u.id) }}">
-<button type="submit">{{ 'Make member' if u.role == 'admin' else 'Make admin' }}</button></form>{% endif %}</td></tr>
+<button type="submit">{{ 'Make member' if u.role == 'admin' else 'Make admin' }}</button></form>{% endif %}</td>{% endif %}</tr>
 {% endfor %}</table>
 <h2>Create user</h2>
 <form method="post" action="{{ url_for('admin_users') }}">
@@ -216,6 +222,11 @@ def is_admin(user):
     """Admin means the user has the "admin" role."""
     return user is not None and user.role == "admin"
 
+def is_bootstrap_admin(user):
+    """True if user is the account named by the ADMIN_USERNAME env var."""
+    name = os.environ.get("ADMIN_USERNAME", "").strip()
+    return user is not None and bool(name) and user.username == name
+
 def admin_required(view):
     @wraps(view)
     def wrapper(*args, **kwargs):
@@ -260,7 +271,8 @@ def admin_users():
                 flash("That username is already taken.")
         return redirect(url_for("admin_users"))
     users = User.query.order_by(User.username).all()
-    return render(ADMIN_USERS, users=users, current_id=current_user().id)
+    bootstrap_id = next((u.id for u in users if is_bootstrap_admin(u)), None)
+    return render(ADMIN_USERS, users=users, current_id=current_user().id, bootstrap_id=bootstrap_id)
 
 @app.route("/admin/users/<int:user_id>/password", methods=["POST"])
 @admin_required
@@ -268,6 +280,9 @@ def admin_reset_password(user_id):
     user = db.session.get(User, user_id)
     if user is None:
         abort(404)
+    if is_bootstrap_admin(user) and user.id != current_user().id:
+        flash("The bootstrap admin account is protected.")
+        return redirect(url_for("admin_users"))
     password = request.form.get("password", "")
     if len(password) < 8:
         flash("Password must be at least 8 characters.")
@@ -283,6 +298,9 @@ def admin_toggle_user(user_id):
     user = db.session.get(User, user_id)
     if user is None:
         abort(404)
+    if is_bootstrap_admin(user) and user.id != current_user().id:
+        flash("The bootstrap admin account is protected.")
+        return redirect(url_for("admin_users"))
     if user.id == current_user().id:
         flash("You cannot disable your own account.")
     else:
@@ -297,6 +315,9 @@ def admin_set_role(user_id):
     user = db.session.get(User, user_id)
     if user is None:
         abort(404)
+    if is_bootstrap_admin(user):
+        flash("The bootstrap admin account is protected.")
+        return redirect(url_for("admin_users"))
     if user.id == current_user().id:
         flash("You cannot change your own role.")
     else:
