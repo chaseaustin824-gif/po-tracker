@@ -1,5 +1,6 @@
 import json
 import os
+import click
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from functools import wraps
@@ -166,7 +167,7 @@ LOGIN = """
 
 ADMIN_USERS = """
 <h2>Users</h2>
-<table><tr><th>Username</th><th>Role</th><th>Status</th><th>Reset password</th><th></th><th></th></tr>
+<table><tr><th>Username</th><th>Role</th><th>Status</th><th>Reset password</th><th></th><th></th><th>Lock</th></tr>
 {% for u in users %}<tr><td>{{ u.username }}</td><td>{{ u.role }}</td><td>{{ 'Active' if u.is_active else 'Disabled' }}</td>
 {% if u.id == bootstrap_id and u.id != current_id %}<td colspan="3">Protected</td>{% else %}
 <td><form method="post" action="{{ url_for('admin_reset_password', user_id=u.id) }}">
@@ -175,7 +176,8 @@ ADMIN_USERS = """
 <td>{% if u.id != current_id %}<form method="post" action="{{ url_for('admin_toggle_user', user_id=u.id) }}">
 <button type="submit">{{ 'Disable' if u.is_active else 'Enable' }}</button></form>{% endif %}</td>
 <td>{% if u.id != current_id %}<form method="post" action="{{ url_for('admin_set_role', user_id=u.id) }}">
-<button type="submit">{{ 'Make member' if u.role == 'admin' else 'Make admin' }}</button></form>{% endif %}</td>{% endif %}</tr>
+<button type="submit">{{ 'Make member' if u.role == 'admin' else 'Make admin' }}</button></form>{% endif %}</td>{% endif %}
+<td>{% if u.username.strip().lower() in locked_usernames %}<strong>Locked</strong> <form method="post" action="{{ url_for('admin_unlock_user', user_id=u.id) }}" style="display:inline"><button type="submit">Unlock</button></form>{% endif %}</td></tr>
 {% endfor %}</table>
 <h2>Create user</h2>
 <form method="post" action="{{ url_for('admin_users') }}">
@@ -216,11 +218,14 @@ def require_login():
     return redirect(url_for("login", next=next_url) if next_url else url_for("login"))
 
 # Login throttling: 5 failed attempts within a 15-minute window for the same
-# username OR the same client IP locks that key for 15 minutes, measured from
-# the most recent failure. While a key is locked the password is not checked.
-# Counts live in the login_attempt table so they survive redeploys. Unknown
-# usernames are counted exactly like known ones so responses never reveal
-# whether an account exists. A successful login clears both keys.
+# username locks that username for 15 minutes, measured from the most recent
+# failure. There is no per-IP limit, because behind a shared proxy one client
+# address could lock out every user. While a username is locked the password
+# is not checked. Counts live in the login_attempt table so they survive
+# redeploys. Unknown usernames are counted exactly like known ones so
+# responses never reveal whether an account exists. A successful login clears
+# the username's failures, and an admin can unlock a username from the Users
+# page or with the "flask unlock-user" command.
 LOGIN_MAX_FAILURES = 5
 LOGIN_WINDOW = timedelta(minutes=15)
 LOGIN_LOCKOUT = timedelta(minutes=15)
@@ -229,19 +234,22 @@ def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 def _throttle_keys(username):
-    keys = ["ip:" + (request.remote_addr or "unknown")]
     name = username.strip().lower()[:100]
-    if name:
-        keys.append("user:" + name)
-    return keys
+    if not name:
+        return []
+    return ["user:" + name]
 
 def _login_locked(keys):
+    if not keys:
+        return False
     now = _utcnow()
     return db.session.query(LoginAttempt.id).filter(
         LoginAttempt.key.in_(keys), LoginAttempt.locked_until > now
     ).first() is not None
 
 def _record_login_failure(keys):
+    if not keys:
+        return
     for attempt in range(2):
         now = _utcnow()
         rows = {r.key: r for r in LoginAttempt.query.filter(LoginAttempt.key.in_(keys)).all()}
@@ -265,6 +273,8 @@ def _record_login_failure(keys):
             db.session.rollback()
 
 def _clear_login_failures(keys):
+    if not keys:
+        return
     LoginAttempt.query.filter(LoginAttempt.key.in_(keys)).delete(synchronize_session=False)
     db.session.commit()
 
@@ -363,7 +373,35 @@ def admin_users():
         return redirect(url_for("admin_users"))
     users = User.query.order_by(User.username).all()
     bootstrap_id = next((u.id for u in users if is_bootstrap_admin(u)), None)
-    return render(ADMIN_USERS, users=users, current_id=current_user().id, bootstrap_id=bootstrap_id)
+    locked_keys = db.session.query(LoginAttempt.key).filter(
+        LoginAttempt.key.like("user:%"), LoginAttempt.locked_until > _utcnow()
+    ).all()
+    locked_usernames = {k[len("user:"):] for (k,) in locked_keys}
+    return render(ADMIN_USERS, users=users, current_id=current_user().id, bootstrap_id=bootstrap_id,
+                  locked_usernames=locked_usernames)
+
+@app.route("/admin/users/<int:user_id>/unlock", methods=["POST"])
+@admin_required
+def admin_unlock_user(user_id):
+    target = db.session.get(User, user_id)
+    if target is None:
+        abort(404)
+    LoginAttempt.query.filter(
+        LoginAttempt.key == "user:" + target.username.strip().lower()
+    ).delete(synchronize_session=False)
+    db.session.commit()
+    flash(f"Unlocked {target.username}.")
+    return redirect(url_for("admin_users"))
+
+@app.cli.command("unlock-user")
+@click.argument("username")
+def unlock_user_command(username):
+    """Clear login throttling for USERNAME."""
+    LoginAttempt.query.filter(
+        LoginAttempt.key == "user:" + username.strip().lower()
+    ).delete(synchronize_session=False)
+    db.session.commit()
+    click.echo(f"Unlocked {username}.")
 
 @app.route("/admin/users/<int:user_id>/password", methods=["POST"])
 @admin_required
