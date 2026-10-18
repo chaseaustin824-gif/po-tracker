@@ -167,7 +167,7 @@ LOGIN = """
 
 ADMIN_USERS = """
 <h2>Users</h2>
-<table><tr><th>Username</th><th>Role</th><th>Status</th><th>Reset password</th><th></th><th></th><th>Lock</th></tr>
+<table><tr><th>Username</th><th>Role</th><th>Status</th><th>Reset password</th><th></th><th></th><th>Lock</th><th>Delete</th></tr>
 {% for u in users %}<tr><td>{{ u.username }}</td><td>{{ u.role }}</td><td>{{ 'Active' if u.is_active else 'Disabled' }}</td>
 {% if u.id == bootstrap_id and u.id != current_id %}<td colspan="3">Protected</td>{% else %}
 <td><form method="post" action="{{ url_for('admin_reset_password', user_id=u.id) }}">
@@ -177,7 +177,9 @@ ADMIN_USERS = """
 <button type="submit">{{ 'Disable' if u.is_active else 'Enable' }}</button></form>{% endif %}</td>
 <td>{% if u.id != current_id %}<form method="post" action="{{ url_for('admin_set_role', user_id=u.id) }}">
 <button type="submit">{{ 'Make member' if u.role == 'admin' else 'Make admin' }}</button></form>{% endif %}</td>{% endif %}
-<td>{% if u.username.strip().lower() in locked_usernames %}<strong>Locked</strong> <form method="post" action="{{ url_for('admin_unlock_user', user_id=u.id) }}" style="display:inline"><button type="submit">Unlock</button></form>{% endif %}</td></tr>
+<td>{% if u.username.strip().lower() in locked_usernames %}<strong>Locked</strong> <form method="post" action="{{ url_for('admin_unlock_user', user_id=u.id) }}" style="display:inline"><button type="submit">Unlock</button></form>{% endif %}</td>
+<td>{% if u.id != current_id and u.id != bootstrap_id %}<form method="post" action="{{ url_for('admin_delete_user', user_id=u.id) }}" style="display:inline" onsubmit="return confirm('Delete user {{ u.username }}? Their POs are kept but show no creator. This cannot be undone.');">
+<button type="submit">Delete</button></form>{% endif %}</td></tr>
 {% endfor %}</table>
 <h2>Create user</h2>
 <form method="post" action="{{ url_for('admin_users') }}">
@@ -453,6 +455,35 @@ def admin_set_role(user_id):
         user.role = "member" if user.role == "admin" else "admin"
         db.session.commit()
         flash(f"{user.username} is now {user.role}.")
+    return redirect(url_for("admin_users"))
+
+@app.route("/admin/users/<int:user_id>/delete", methods=["POST"])
+@admin_required
+def admin_delete_user(user_id):
+    user = db.session.get(User, user_id)
+    if user is None:
+        abort(404)
+    if is_bootstrap_admin(user):
+        flash("The bootstrap admin account is protected.")
+        return redirect(url_for("admin_users"))
+    if user.id == current_user().id:
+        flash("You cannot delete your own account.")
+        return redirect(url_for("admin_users"))
+    username = user.username
+    try:
+        PurchaseOrder.query.filter(PurchaseOrder.created_by_id == user.id).update(
+            {PurchaseOrder.created_by_id: None}, synchronize_session=False
+        )
+        LoginAttempt.query.filter(
+            LoginAttempt.key == "user:" + username.strip().lower()
+        ).delete(synchronize_session=False)
+        db.session.delete(user)
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        flash("Could not delete user.")
+        return redirect(url_for("admin_users"))
+    flash(f"Deleted user {username}.")
     return redirect(url_for("admin_users"))
 
 @app.route("/")
