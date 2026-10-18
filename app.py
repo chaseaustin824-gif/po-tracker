@@ -1,12 +1,18 @@
+import hmac
 import json
 import os
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
-from flask import Flask, Response, request, redirect, url_for, render_template_string, flash
+from flask import Flask, Response, request, redirect, url_for, render_template_string, flash, session
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
+app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.permanent_session_lifetime = timedelta(hours=12)
 db_url = os.environ.get("DATABASE_URL", "sqlite:///local.db")
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
@@ -37,7 +43,7 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;pad
 .flash{color:#b00}.total{font-size:1.4rem;font-weight:bold}input,textarea{width:100%;padding:.4rem;margin:.2rem 0 .8rem}
 button,a.btn{padding:.5rem 1rem;text-decoration:none}</style></head><body>
 <h1>PO Tracker</h1>
-<p><a class="btn" href="{{ url_for('index') }}">Dashboard</a> <a class="btn" href="{{ url_for('new_po') }}">New PO</a></p>
+<p><a class="btn" href="{{ url_for('index') }}">Dashboard</a> <a class="btn" href="{{ url_for('new_po') }}">New PO</a>{% if session.get('authenticated') %} <a class="btn" href="{{ url_for('logout') }}">Log out</a>{% endif %}</p>
 {% for m in get_flashed_messages() %}<p class="flash">{{ m }}</p>{% endfor %}
 {{ body|safe }}
 <script>if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js');</script>
@@ -61,8 +67,52 @@ FORM = """
 </form>
 """
 
+LOGIN = """
+<form method="post">
+<input type="hidden" name="next" value="{{ next_url }}">
+<label>Password<input type="password" name="password" required autofocus autocomplete="current-password"></label>
+<button type="submit">Sign in</button>
+</form>
+"""
+
 def render(template, **ctx):
     return render_template_string(BASE, body=render_template_string(template, **ctx))
+
+PUBLIC_ENDPOINTS = {"login", "logout", "healthz", "manifest", "icon", "sw", "static"}
+
+def safe_next(target):
+    # Only allow same-site relative paths to prevent open redirects.
+    if target and target.startswith("/") and not target.startswith("//") and "\\" not in target:
+        return target
+    return "/"
+
+@app.before_request
+def require_login():
+    if request.endpoint is None or request.endpoint in PUBLIC_ENDPOINTS:
+        return None
+    if not session.get("authenticated"):
+        return redirect(url_for("login", next=request.path))
+    return None
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    next_url = safe_next(request.values.get("next", ""))
+    if request.method == "POST":
+        expected = os.environ.get("APP_PASSWORD", "")
+        submitted = request.form.get("password", "")
+        # If APP_PASSWORD is unset or empty, login always fails.
+        if expected and hmac.compare_digest(submitted.encode(), expected.encode()):
+            session.clear()
+            session.permanent = True
+            session["authenticated"] = True
+            return redirect(next_url)
+        flash("Incorrect password.")
+    return render(LOGIN, next_url=next_url)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
 
 @app.route("/")
 def index():
