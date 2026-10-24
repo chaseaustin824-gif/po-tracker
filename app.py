@@ -39,7 +39,7 @@ class PurchaseOrder(db.Model):
     amount = db.Column(db.Numeric(12, 2), nullable=False)
     created_at = db.Column(db.DateTime, server_default=func.now())
     created_by_id = db.Column(db.Integer, db.ForeignKey("app_user.id"), nullable=True)
-    # Attachment rows are removed with the PO (bucket objects are removed in delete_po).
+    # Attachment rows are removed with the PO (bucket objects are kept).
     attachments = db.relationship(
         "PurchaseOrderAttachment", backref="po", cascade="all, delete-orphan",
         order_by="PurchaseOrderAttachment.id",
@@ -55,6 +55,8 @@ class PurchaseOrderAttachment(db.Model):
     size_bytes = db.Column(db.Integer)
     uploaded_by_id = db.Column(db.Integer, db.ForeignKey("app_user.id"), nullable=True)
     created_at = db.Column(db.DateTime, server_default=func.now())
+    deleted_at = db.Column(db.DateTime, nullable=True)
+    deleted_by_id = db.Column(db.Integer, db.ForeignKey("app_user.id"), nullable=True)
 
 class User(db.Model):
     __tablename__ = "app_user"
@@ -104,6 +106,22 @@ with app.app_context():
                 "ALTER TABLE purchase_order ADD COLUMN created_by_id INTEGER REFERENCES app_user(id)"
             ))
             db.session.commit()
+    # Idempotent migration: add the soft-delete columns to pre-existing po_attachment tables.
+    if _dialect == "postgresql":
+        db.session.execute(text("ALTER TABLE po_attachment ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP"))
+        db.session.execute(text(
+            "ALTER TABLE po_attachment ADD COLUMN IF NOT EXISTS deleted_by_id INTEGER REFERENCES app_user(id)"
+        ))
+        db.session.commit()
+    elif _dialect == "sqlite":
+        _att_cols = [row[1] for row in db.session.execute(text("PRAGMA table_info(po_attachment)")).fetchall()]
+        if "deleted_at" not in _att_cols:
+            db.session.execute(text("ALTER TABLE po_attachment ADD COLUMN deleted_at DATETIME"))
+        if "deleted_by_id" not in _att_cols:
+            db.session.execute(text(
+                "ALTER TABLE po_attachment ADD COLUMN deleted_by_id INTEGER REFERENCES app_user(id)"
+            ))
+        db.session.commit()
     # Bootstrap the first admin from the environment when no users exist yet.
     _admin_username = os.environ.get("ADMIN_USERNAME", "").strip()
     _admin_password = os.environ.get("ADMIN_PASSWORD", "")
@@ -180,12 +198,20 @@ PO_DETAIL = """
 <strong>Created by:</strong> {{ creator or '-' }}</p>
 <h3>Attachments</h3>
 <table><tr><th>File</th><th>Size</th><th>Uploaded</th>{% if is_admin %}<th></th>{% endif %}</tr>
-{% for a in po.attachments %}<tr><td><a href="{{ url_for('view_attachment', attachment_id=a.id) }}" target="_blank" rel="noopener">{{ a.original_filename or 'attachment' }}</a></td>
+{% for a in active %}<tr><td><a href="{{ url_for('view_attachment', attachment_id=a.id) }}" target="_blank" rel="noopener">{{ a.original_filename or 'attachment' }}</a></td>
 <td>{{ "{:,.1f}".format((a.size_bytes or 0) / 1024) }} KB</td>
 <td>{{ a.created_at.strftime('%Y-%m-%d') if a.created_at else '' }}</td>
-{% if is_admin %}<td><form method="post" action="{{ url_for('delete_attachment', attachment_id=a.id) }}" style="display:inline" onsubmit="return confirm('Delete this attachment? This cannot be undone.');">
+{% if is_admin %}<td><form method="post" action="{{ url_for('delete_attachment', attachment_id=a.id) }}" style="display:inline" onsubmit="return confirm('Remove this attachment? The file can be restored later.');">
 <button type="submit">Delete</button></form></td>{% endif %}</tr>
 {% else %}<tr><td colspan="{{ 4 if is_admin else 3 }}">No attachments yet.</td></tr>{% endfor %}</table>
+{% if is_admin and removed %}<h3>Removed attachments</h3>
+<table><tr><th>File</th><th>Removed</th><th>Removed by</th><th></th></tr>
+{% for a, remover in removed %}<tr><td><a href="{{ url_for('view_attachment', attachment_id=a.id) }}" target="_blank" rel="noopener">{{ a.original_filename or 'attachment' }}</a></td>
+<td>{{ a.deleted_at.strftime('%Y-%m-%d') }}</td>
+<td>{{ remover or '-' }}</td>
+<td><form method="post" action="{{ url_for('restore_attachment', attachment_id=a.id) }}" style="display:inline">
+<button type="submit">Restore</button></form></td></tr>
+{% endfor %}</table>{% endif %}
 <form method="post" action="{{ url_for('upload_attachment', po_id=po.id) }}" enctype="multipart/form-data">
 <label>Attach invoice (PDF, JPG, PNG or HEIC, max 10 MB)<input type="file" name="file" required accept=".pdf,.jpg,.jpeg,.png,.heic,.heif"></label>
 <button type="submit">Upload</button>
@@ -608,15 +634,9 @@ def delete_po(po_id):
     po = db.session.get(PurchaseOrder, po_id)
     if po is None:
         abort(404)
-    # Attachment rows cascade with the PO; remove their bucket objects after the commit.
-    keys = [a.storage_key for a in po.attachments]
+    # Attachment rows cascade with the PO; bucket objects are intentionally kept (and backed up).
     db.session.delete(po)
     db.session.commit()
-    for key in keys:
-        try:
-            _s3_delete(key)
-        except (ClientError, BotoCoreError, RuntimeError):
-            app.logger.warning("Could not delete attachment object %s", key)
     flash(f"Deleted PO-{po_id}.")
     return redirect(url_for("index"))
 
@@ -672,7 +692,15 @@ def po_detail(po_id):
         abort(404)
     creator_user = db.session.get(User, po.created_by_id) if po.created_by_id else None
     creator = creator_user.username if creator_user else None
-    return render(PO_DETAIL, po=po, creator=creator, is_admin=is_admin(current_user()))
+    admin = is_admin(current_user())
+    active = [a for a in po.attachments if a.deleted_at is None]
+    removed = []
+    if admin:
+        for a in po.attachments:
+            if a.deleted_at is not None:
+                remover = db.session.get(User, a.deleted_by_id) if a.deleted_by_id else None
+                removed.append((a, remover.username if remover else None))
+    return render(PO_DETAIL, po=po, creator=creator, is_admin=admin, active=active, removed=removed)
 
 @app.route("/pos/<int:po_id>/attachments", methods=["POST"])
 def upload_attachment(po_id):
@@ -728,7 +756,7 @@ def upload_attachment(po_id):
 @app.route("/attachments/<int:attachment_id>")
 def view_attachment(attachment_id):
     att = db.session.get(PurchaseOrderAttachment, attachment_id)
-    if att is None:
+    if att is None or (att.deleted_at is not None and not is_admin(current_user())):
         abort(404)
     try:
         url = _s3_client().generate_presigned_url(
@@ -748,17 +776,25 @@ def delete_attachment(attachment_id):
     att = db.session.get(PurchaseOrderAttachment, attachment_id)
     if att is None:
         abort(404)
-    po_id = att.po_id
-    try:
-        _s3_delete(att.storage_key)
-    except (ClientError, BotoCoreError, RuntimeError):
-        app.logger.exception("Could not delete attachment object %s", attachment_id)
-        flash("Could not delete the attachment from storage.")
-        return redirect(url_for("po_detail", po_id=po_id))
-    db.session.delete(att)
+    # Soft delete: the bucket object is kept so the attachment can be restored.
+    if att.deleted_at is None:
+        att.deleted_at = datetime.utcnow()
+        att.deleted_by_id = current_user().id
+        db.session.commit()
+    flash("Attachment removed. An admin can restore it.")
+    return redirect(url_for("po_detail", po_id=att.po_id))
+
+@app.route("/attachments/<int:attachment_id>/restore", methods=["POST"])
+@admin_required
+def restore_attachment(attachment_id):
+    att = db.session.get(PurchaseOrderAttachment, attachment_id)
+    if att is None:
+        abort(404)
+    att.deleted_at = None
+    att.deleted_by_id = None
     db.session.commit()
-    flash("Attachment deleted.")
-    return redirect(url_for("po_detail", po_id=po_id))
+    flash("Attachment restored.")
+    return redirect(url_for("po_detail", po_id=att.po_id))
 
 @app.route("/logo.png")
 def logo():
