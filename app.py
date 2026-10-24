@@ -1,6 +1,10 @@
 import json
 import os
+import uuid
+import boto3
 import click
+from botocore.client import Config
+from botocore.exceptions import BotoCoreError, ClientError
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from functools import wraps
@@ -9,7 +13,9 @@ from flask import Flask, Response, abort, request, redirect, url_for, render_tem
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
@@ -22,6 +28,8 @@ if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {"pool_pre_ping": True}
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024
 db = SQLAlchemy(app)
 
 class PurchaseOrder(db.Model):
@@ -31,6 +39,22 @@ class PurchaseOrder(db.Model):
     amount = db.Column(db.Numeric(12, 2), nullable=False)
     created_at = db.Column(db.DateTime, server_default=func.now())
     created_by_id = db.Column(db.Integer, db.ForeignKey("app_user.id"), nullable=True)
+    # Attachment rows are removed with the PO (bucket objects are removed in delete_po).
+    attachments = db.relationship(
+        "PurchaseOrderAttachment", backref="po", cascade="all, delete-orphan",
+        order_by="PurchaseOrderAttachment.id",
+    )
+
+class PurchaseOrderAttachment(db.Model):
+    __tablename__ = "po_attachment"
+    id = db.Column(db.Integer, primary_key=True)
+    po_id = db.Column(db.Integer, db.ForeignKey("purchase_order.id"), nullable=False, index=True)
+    storage_key = db.Column(db.String(255), nullable=False, unique=True)
+    original_filename = db.Column(db.String(255))
+    content_type = db.Column(db.String(100))
+    size_bytes = db.Column(db.Integer)
+    uploaded_by_id = db.Column(db.Integer, db.ForeignKey("app_user.id"), nullable=True)
+    created_at = db.Column(db.DateTime, server_default=func.now())
 
 class User(db.Model):
     __tablename__ = "app_user"
@@ -138,13 +162,34 @@ button,a.btn{padding:.5rem 1rem;text-decoration:none}
 INDEX = """
 <p class="total">Total: ${{ "{:,.2f}".format(total) }} ({{ count }} POs)</p>
 <table><tr><th>PO #</th><th>Vendor</th><th>Description</th><th>Amount</th><th>Created</th><th>Created by</th>{% if is_admin %}<th></th>{% endif %}</tr>
-{% for po in pos %}<tr><td>PO-{{ po.id }}</td><td>{{ po.vendor }}</td><td>{{ po.description }}</td>
+{% for po in pos %}<tr><td><a href="{{ url_for('po_detail', po_id=po.id) }}">PO-{{ po.id }}</a></td><td>{{ po.vendor }}</td><td>{{ po.description }}</td>
 <td>${{ "{:,.2f}".format(po.amount) }}</td><td>{{ po.created_at.strftime('%Y-%m-%d') if po.created_at else '' }}</td>
 <td>{{ creators.get(po.created_by_id, '-') if po.created_by_id else '-' }}</td>
 {% if is_admin %}<td><a class="btn" href="{{ url_for('edit_po', po_id=po.id) }}">Edit</a>
 <form method="post" action="{{ url_for('delete_po', po_id=po.id) }}" style="display:inline" onsubmit="return confirm('Delete PO-{{ po.id }}? This cannot be undone.');">
 <button type="submit">Delete</button></form></td>{% endif %}</tr>
 {% else %}<tr><td colspan="{{ 7 if is_admin else 6 }}">No purchase orders yet.</td></tr>{% endfor %}</table>
+"""
+
+PO_DETAIL = """
+<h2>PO-{{ po.id }}</h2>
+<p><strong>Vendor:</strong> {{ po.vendor }}<br>
+<strong>Description:</strong> {{ po.description }}<br>
+<strong>Amount:</strong> ${{ "{:,.2f}".format(po.amount) }}<br>
+<strong>Created:</strong> {{ po.created_at.strftime('%Y-%m-%d') if po.created_at else '' }}<br>
+<strong>Created by:</strong> {{ creator or '-' }}</p>
+<h3>Attachments</h3>
+<table><tr><th>File</th><th>Size</th><th>Uploaded</th>{% if is_admin %}<th></th>{% endif %}</tr>
+{% for a in po.attachments %}<tr><td><a href="{{ url_for('view_attachment', attachment_id=a.id) }}" target="_blank" rel="noopener">{{ a.original_filename or 'attachment' }}</a></td>
+<td>{{ "{:,.1f}".format((a.size_bytes or 0) / 1024) }} KB</td>
+<td>{{ a.created_at.strftime('%Y-%m-%d') if a.created_at else '' }}</td>
+{% if is_admin %}<td><form method="post" action="{{ url_for('delete_attachment', attachment_id=a.id) }}" style="display:inline" onsubmit="return confirm('Delete this attachment? This cannot be undone.');">
+<button type="submit">Delete</button></form></td>{% endif %}</tr>
+{% else %}<tr><td colspan="{{ 4 if is_admin else 3 }}">No attachments yet.</td></tr>{% endfor %}</table>
+<form method="post" action="{{ url_for('upload_attachment', po_id=po.id) }}" enctype="multipart/form-data">
+<label>Attach invoice (PDF, JPG, PNG or HEIC, max 10 MB)<input type="file" name="file" required accept=".pdf,.jpg,.jpeg,.png,.heic,.heif"></label>
+<button type="submit">Upload</button>
+</form>
 """
 
 FORM = """
@@ -563,10 +608,157 @@ def delete_po(po_id):
     po = db.session.get(PurchaseOrder, po_id)
     if po is None:
         abort(404)
+    # Attachment rows cascade with the PO; remove their bucket objects after the commit.
+    keys = [a.storage_key for a in po.attachments]
     db.session.delete(po)
     db.session.commit()
+    for key in keys:
+        try:
+            _s3_delete(key)
+        except (ClientError, BotoCoreError, RuntimeError):
+            app.logger.warning("Could not delete attachment object %s", key)
     flash(f"Deleted PO-{po_id}.")
     return redirect(url_for("index"))
+
+# Attachments live in a private Railway Bucket (S3-compatible); the DB stores only metadata.
+HEIC_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}
+
+def detect_file_type(data):
+    """Return (content_type, extension) from magic bytes, or None if not allowed."""
+    if data.startswith(b"%PDF-"):
+        return "application/pdf", "pdf"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", "jpg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "png"
+    if data[4:8] == b"ftyp" and data[8:12] in HEIC_BRANDS:
+        return ("image/heif", "heif") if data[8:12] in (b"mif1", b"msf1") else ("image/heic", "heic")
+    return None
+
+def _bucket_name():
+    name = os.environ.get("BUCKET_NAME", "")
+    if not name:
+        raise RuntimeError("Attachment storage is not configured.")
+    return name
+
+def _s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=os.environ.get("BUCKET_ENDPOINT"),
+        region_name=os.environ.get("BUCKET_REGION"),
+        aws_access_key_id=os.environ.get("BUCKET_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("BUCKET_SECRET_ACCESS_KEY"),
+        config=Config(signature_version="s3v4"),
+    )
+
+def _s3_delete(key):
+    """Delete one object; a missing object is not an error."""
+    try:
+        _s3_client().delete_object(Bucket=_bucket_name(), Key=key)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") not in ("NoSuchKey", "404", "NotFound"):
+            raise
+
+@app.errorhandler(RequestEntityTooLarge)
+def file_too_large(_exc):
+    flash("File is too large (max 10 MB).")
+    po_id = (request.view_args or {}).get("po_id")
+    return redirect(url_for("po_detail", po_id=po_id) if po_id else url_for("index"))
+
+@app.route("/pos/<int:po_id>")
+def po_detail(po_id):
+    po = db.session.get(PurchaseOrder, po_id)
+    if po is None:
+        abort(404)
+    creator_user = db.session.get(User, po.created_by_id) if po.created_by_id else None
+    creator = creator_user.username if creator_user else None
+    return render(PO_DETAIL, po=po, creator=creator, is_admin=is_admin(current_user()))
+
+@app.route("/pos/<int:po_id>/attachments", methods=["POST"])
+def upload_attachment(po_id):
+    po = db.session.get(PurchaseOrder, po_id)
+    if po is None:
+        abort(404)
+    back = redirect(url_for("po_detail", po_id=po_id))
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        flash("Choose a file to upload.")
+        return back
+    data = upload.stream.read(MAX_ATTACHMENT_BYTES + 1)
+    if len(data) > MAX_ATTACHMENT_BYTES:
+        flash("File is too large (max 10 MB).")
+        return back
+    if not data:
+        flash("The file is empty.")
+        return back
+    detected = detect_file_type(data)
+    if detected is None:
+        flash("Unsupported file type. Upload a PDF, JPEG, PNG or HEIC file.")
+        return back
+    content_type, ext = detected
+    key = f"attachments/{po_id}/{uuid.uuid4()}.{ext}"
+    try:
+        _s3_client().put_object(Bucket=_bucket_name(), Key=key, Body=data, ContentType=content_type)
+    except (ClientError, BotoCoreError, RuntimeError):
+        app.logger.exception("Attachment upload failed for PO-%s", po_id)
+        flash("Could not store the attachment. Please try again.")
+        return back
+    try:
+        db.session.add(PurchaseOrderAttachment(
+            po_id=po_id,
+            storage_key=key,
+            original_filename=secure_filename(upload.filename)[:255] or "attachment",
+            content_type=content_type,
+            size_bytes=len(data),
+            uploaded_by_id=current_user().id,
+        ))
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        app.logger.exception("Attachment row insert failed for PO-%s", po_id)
+        try:
+            _s3_delete(key)
+        except (ClientError, BotoCoreError, RuntimeError):
+            app.logger.warning("Could not clean up uploaded object %s", key)
+        flash("Could not save the attachment. Please try again.")
+        return back
+    flash("Attachment uploaded.")
+    return back
+
+@app.route("/attachments/<int:attachment_id>")
+def view_attachment(attachment_id):
+    att = db.session.get(PurchaseOrderAttachment, attachment_id)
+    if att is None:
+        abort(404)
+    try:
+        url = _s3_client().generate_presigned_url(
+            "get_object",
+            Params={"Bucket": _bucket_name(), "Key": att.storage_key},
+            ExpiresIn=300,
+        )
+    except (ClientError, BotoCoreError, RuntimeError):
+        app.logger.exception("Could not presign attachment %s", attachment_id)
+        flash("Could not open the attachment.")
+        return redirect(url_for("po_detail", po_id=att.po_id))
+    return redirect(url)
+
+@app.route("/attachments/<int:attachment_id>/delete", methods=["POST"])
+@admin_required
+def delete_attachment(attachment_id):
+    att = db.session.get(PurchaseOrderAttachment, attachment_id)
+    if att is None:
+        abort(404)
+    po_id = att.po_id
+    try:
+        _s3_delete(att.storage_key)
+    except (ClientError, BotoCoreError, RuntimeError):
+        app.logger.exception("Could not delete attachment object %s", attachment_id)
+        flash("Could not delete the attachment from storage.")
+        return redirect(url_for("po_detail", po_id=po_id))
+    db.session.delete(att)
+    db.session.commit()
+    flash("Attachment deleted.")
+    return redirect(url_for("po_detail", po_id=po_id))
 
 @app.route("/logo.png")
 def logo():
